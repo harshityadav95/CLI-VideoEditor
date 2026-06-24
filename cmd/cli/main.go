@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	defaultInputDir  = "./sept 3"
-	defaultOutput    = "~/Movies/stitched.mp4"
+	defaultInputDir  = "/Volumes/macvault/100GOPRO"
+	defaultOutputDir = "combined"
+	defaultOutExt    = ".mp4"
 	appCacheSubdir   = ".cache/cli-videoeditor/bin"
 	ffmpegZipName    = "ffmpeg.zip"
 	ffprobeZipName   = "ffprobe.zip"
@@ -60,25 +61,38 @@ type ffprobeStream struct {
 }
 
 type VideoInfo struct {
-	Path             string
-	HasVideo         bool
-	VideoCodec       string
-	Width            int
-	Height           int
-	PixFmt           string
-	RFrameRate       string
-	HasAudio         bool
-	AudioCodec       string
-	AudioSampleRate  string
-	AudioChannels    int
-	AudioLayout      string
-	DurationSeconds  float64
+	Path            string
+	HasVideo        bool
+	VideoCodec      string
+	Width           int
+	Height          int
+	PixFmt          string
+	RFrameRate      string
+	HasAudio        bool
+	AudioCodec      string
+	AudioSampleRate string
+	AudioChannels   int
+	AudioLayout     string
+	DurationSeconds float64
 }
 
 type Uniformity struct {
 	VideoUniform bool
 	AudioUniform bool
 	Reason       string
+}
+
+type EncodeTarget struct {
+	VideoCodec      string
+	Width           int
+	Height          int
+	PixFmt          string
+	RFrameRate      string
+	HasAudio        bool
+	AudioCodec      string
+	AudioSampleRate string
+	AudioChannels   int
+	AudioLayout     string
 }
 
 func main() {
@@ -90,11 +104,15 @@ func main() {
 		noPrompt      bool
 	)
 	flag.StringVar(&inputDir, "input", defaultInputDir, "Input folder (non-recursive)")
-	flag.StringVar(&outputPath, "output", defaultOutput, "Output file path")
+	flag.StringVar(&outputPath, "output", "", "Output file path (defaults to combined/<timestamp>.mp4)")
 	flag.BoolVar(&mute, "mute", false, "Mute audio in the output")
 	flag.BoolVar(&forceFallback, "force-fallback", false, "Force re-encode using Apple VideoToolbox instead of stream copy")
 	flag.BoolVar(&noPrompt, "no-prompt", false, "Non-interactive mode (do not prompt)")
 	flag.Parse()
+
+	if strings.TrimSpace(outputPath) == "" {
+		outputPath = defaultCombinedOutputPath(inputDir)
+	}
 
 	absInput, err := filepath.Abs(inputDir)
 	must(err)
@@ -113,8 +131,8 @@ func main() {
 		fmt.Printf("  - %s\n", filepath.Base(f))
 	}
 
-	infos, uni, vPref := analyzeInputs(ffprobePath, files)
-	printSummary(infos, uni)
+	infos, uni, target := analyzeInputs(ffprobePath, files)
+	printSummary(infos, uni, target)
 
 	// Ask user for audio choice and output path if interactive.
 	if !noPrompt {
@@ -153,10 +171,10 @@ func main() {
 	tryCopy := !forceFallback
 	if tryCopy {
 		// Only try zero-reencode copy when video and audio are uniform enough.
-		// If user muted audio, it's safer to still require uniformity due to concat demuxer constraints.
+		// If user muted audio, video uniformity is still required for concat demuxer copy.
 		if !uni.VideoUniform || (!mute && !uni.AudioUniform) {
 			tryCopy = false
-			fmt.Println("Streams not uniform; switching to hardware-accelerated re-encode.")
+			fmt.Println("Streams not uniform; switching to hardware-accelerated normalize/encode.")
 		}
 	}
 
@@ -171,8 +189,8 @@ func main() {
 	}
 
 	if !tryCopy {
-		fmt.Println("Running hardware-accelerated encode via VideoToolbox...")
-		err = runFFmpegEncode(ffmpegPath, flistPath, outputPath, mute, vPref)
+		fmt.Println("Running hardware-accelerated normalize/encode via VideoToolbox...")
+		err = runFFmpegEncode(ffmpegPath, files, outputPath, mute, target)
 		must(err)
 	}
 
@@ -218,7 +236,7 @@ func ensureFFBinaries() (string, string, error) {
 
 	// Candidate URLs (attempt in order). These mirrors often provide universal/arm64 zips.
 	ffmpegURLs := []string{
-		"https://evermeet.cx/ffmpeg/getrelease/zip",  // Latest release (universal)
+		"https://evermeet.cx/ffmpeg/getrelease/zip", // Latest release (universal)
 		"https://evermeet.cx/ffmpeg/ffmpeg-6.1.zip",
 		"https://evermeet.cx/ffmpeg/ffmpeg-6.0.zip",
 	}
@@ -334,6 +352,11 @@ func scanInputFiles(dir string) ([]string, error) {
 	return files, nil
 }
 
+func defaultCombinedOutputPath(inputDir string) string {
+	timestamp := time.Now().Format("20060102_150405")
+	return filepath.Join(filepath.Dir(inputDir), defaultOutputDir, timestamp+defaultOutExt)
+}
+
 func naturalSort(a []string) {
 	re := regexp.MustCompile(`\d+|\D+`)
 	sort.Slice(a, func(i, j int) bool {
@@ -358,17 +381,35 @@ func naturalSort(a []string) {
 	})
 }
 
-func analyzeInputs(ffprobePath string, files []string) ([]VideoInfo, Uniformity, string) {
+func analyzeInputs(ffprobePath string, files []string) ([]VideoInfo, Uniformity, EncodeTarget) {
 	infos := make([]VideoInfo, 0, len(files))
-	var vPref string = "h264" // default preference if mixed/unknown
+	videoCounts := map[string]int{}
+	audioCounts := map[string]int{}
+	videoSample := map[string]VideoInfo{}
+	audioSample := map[string]VideoInfo{}
+	allAudio := true
+	allVideo := true
 	for _, f := range files {
 		inf, err := probeOne(ffprobePath, f)
 		if err != nil {
 			failf("ffprobe failed on %s: %v", f, err)
 		}
 		infos = append(infos, inf)
-		if inf.VideoCodec == "hevc" {
-			vPref = "hevc"
+		if !inf.HasVideo {
+			allVideo = false
+		}
+		if !inf.HasAudio {
+			allAudio = false
+		}
+		vKey := videoSignature(inf)
+		aKey := audioSignature(inf)
+		videoCounts[vKey]++
+		audioCounts[aKey]++
+		if _, ok := videoSample[vKey]; !ok {
+			videoSample[vKey] = inf
+		}
+		if _, ok := audioSample[aKey]; !ok {
+			audioSample[aKey] = inf
 		}
 	}
 
@@ -405,7 +446,52 @@ func analyzeInputs(ffprobePath string, files []string) ([]VideoInfo, Uniformity,
 		}
 		u.Reason = strings.Join(reasons, "; ")
 	}
-	return infos, u, vPref
+
+	target := EncodeTarget{}
+	if key, ok := mostCommonKey(videoCounts); ok {
+		s := videoSample[key]
+		target.VideoCodec = s.VideoCodec
+		target.Width = s.Width
+		target.Height = s.Height
+		target.PixFmt = s.PixFmt
+		target.RFrameRate = s.RFrameRate
+	}
+	if key, ok := mostCommonKey(audioCounts); ok {
+		s := audioSample[key]
+		target.HasAudio = allAudio && s.HasAudio
+		target.AudioCodec = s.AudioCodec
+		target.AudioSampleRate = s.AudioSampleRate
+		target.AudioChannels = s.AudioChannels
+		target.AudioLayout = s.AudioLayout
+	}
+	if !allVideo {
+		target.VideoCodec = "h264"
+	}
+	return infos, u, target
+}
+
+func videoSignature(inf VideoInfo) string {
+	return fmt.Sprintf("%t|%s|%dx%d|%s|%s", inf.HasVideo, inf.VideoCodec, inf.Width, inf.Height, inf.PixFmt, inf.RFrameRate)
+}
+
+func audioSignature(inf VideoInfo) string {
+	return fmt.Sprintf("%t|%s|%s|%d|%s", inf.HasAudio, inf.AudioCodec, inf.AudioSampleRate, inf.AudioChannels, inf.AudioLayout)
+}
+
+func mostCommonKey(counts map[string]int) (string, bool) {
+	var (
+		bestKey   string
+		bestCount int
+		found     bool
+	)
+	for key, count := range counts {
+		if !found || count > bestCount {
+			bestKey = key
+			bestCount = count
+			found = true
+		}
+	}
+	return bestKey, found
 }
 
 func probeOne(ffprobePath, file string) (VideoInfo, error) {
@@ -449,7 +535,7 @@ func probeOne(ffprobePath, file string) (VideoInfo, error) {
 	return vi, nil
 }
 
-func printSummary(infos []VideoInfo, uni Uniformity) {
+func printSummary(infos []VideoInfo, uni Uniformity, target EncodeTarget) {
 	totalDur := 0.0
 	vcodec := ""
 	acodec := ""
@@ -475,6 +561,12 @@ func printSummary(infos []VideoInfo, uni Uniformity) {
 	fmt.Printf("- Total duration: %0.1fs\n", totalDur)
 	fmt.Printf("- Uniform video streams: %v\n", uni.VideoUniform)
 	fmt.Printf("- Uniform audio streams: %v\n", uni.AudioUniform)
+	if target.VideoCodec != "" {
+		fmt.Printf("- Majority video target: codec=%s, res=%dx%d, fps=%s\n", target.VideoCodec, target.Width, target.Height, target.RFrameRate)
+	}
+	if target.AudioCodec != "" {
+		fmt.Printf("- Majority audio target: codec=%s, sample_rate=%s, channels=%d, layout=%s\n", target.AudioCodec, target.AudioSampleRate, target.AudioChannels, target.AudioLayout)
+	}
 	if uni.Reason != "" {
 		fmt.Printf("- Non-uniform reason: %s\n", uni.Reason)
 	}
@@ -511,7 +603,6 @@ func runFFmpegCopy(ffmpegPath, fileList, output string, mute bool) error {
 		"-f", "concat", "-safe", "0",
 		"-i", fileList,
 		"-c", "copy",
-		"-movflags", "+faststart",
 	}
 	if mute {
 		args = append(args, "-an")
@@ -523,29 +614,28 @@ func runFFmpegCopy(ffmpegPath, fileList, output string, mute bool) error {
 	return cmd.Run()
 }
 
-func runFFmpegEncode(ffmpegPath, fileList, output string, mute bool, vPref string) error {
+func runFFmpegEncode(ffmpegPath string, files []string, output string, mute bool, target EncodeTarget) error {
 	vCodec := "h264_videotoolbox"
-	tag := ""
-	if vPref == "hevc" || vPref == "h265" {
+	if codecLooksLikeHEVC(target.VideoCodec) {
 		vCodec = "hevc_videotoolbox"
-		tag = "-tag:v hvc1"
 	}
-	args := []string{
-		"-hide_banner", "-loglevel", "error",
-		"-f", "concat", "-safe", "0",
-		"-i", fileList,
-		"-c:v", vCodec,
-		"-pix_fmt", "yuv420p",
-		"-movflags", "+faststart",
+
+	args := []string{"-hide_banner", "-loglevel", "error"}
+	for _, f := range files {
+		args = append(args, "-i", f)
 	}
-	if tag != "" {
-		// split to individual tokens
-		parts := strings.Split(tag, " ")
-		args = append(args, parts...)
+
+	filterComplex, mapArgs, includeAudio, err := buildNormalizeFilter(files, target, mute)
+	if err != nil {
+		return err
 	}
-	if mute {
-		args = append(args, "-an")
-	} else {
+	args = append(args, "-filter_complex", filterComplex)
+	args = append(args, mapArgs...)
+	args = append(args, "-c:v", vCodec, "-pix_fmt", "yuv420p")
+	if vCodec == "hevc_videotoolbox" {
+		args = append(args, "-tag:v", "hvc1")
+	}
+	if includeAudio {
 		args = append(args, "-c:a", "aac", "-b:a", "192k")
 	}
 	args = append(args, "-y", output)
@@ -556,13 +646,69 @@ func runFFmpegEncode(ffmpegPath, fileList, output string, mute bool, vPref strin
 	return cmd.Run()
 }
 
+func buildNormalizeFilter(files []string, target EncodeTarget, mute bool) (string, []string, bool, error) {
+	if len(files) == 0 {
+		return "", nil, false, errors.New("no input files")
+	}
+	if target.Width == 0 || target.Height == 0 {
+		return "", nil, false, errors.New("missing target video size")
+	}
+
+	var parts []string
+	for i := range files {
+		parts = append(parts, fmt.Sprintf("[%d:v]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=%s[v%d]", i, target.Width, target.Height, target.Width, target.Height, target.RFrameRate, i))
+	}
+
+	includeAudio := !mute && target.HasAudio && target.AudioSampleRate != "" && target.AudioChannels > 0 && target.AudioLayout != ""
+	if includeAudio {
+		for i := range files {
+			parts = append(parts, fmt.Sprintf("[%d:a]aformat=sample_rates=%s:channel_layouts=%s,aresample=%s,asetpts=N/SR/TB[a%d]", i, target.AudioSampleRate, target.AudioLayout, target.AudioSampleRate, i))
+		}
+	}
+
+	var concatInputs []string
+	for i := range files {
+		concatInputs = append(concatInputs, fmt.Sprintf("[v%d]", i))
+		if includeAudio {
+			concatInputs = append(concatInputs, fmt.Sprintf("[a%d]", i))
+		}
+	}
+	if includeAudio {
+		parts = append(parts, fmt.Sprintf("%sconcat=n=%d:v=1:a=1[vout][aout]", strings.Join(concatInputs, ""), len(files)))
+	} else {
+		parts = append(parts, fmt.Sprintf("%sconcat=n=%d:v=1:a=0[vout]", strings.Join(concatInputs, ""), len(files)))
+	}
+
+	mapArgs := []string{"-map", "[vout]"}
+	if includeAudio {
+		mapArgs = append(mapArgs, "-map", "[aout]")
+	}
+	return strings.Join(parts, ";"), mapArgs, includeAudio, nil
+}
+
 func expandUser(path string) (string, error) {
-	if strings.HasPrefix(path, "~") {
+	if path == "~" {
 		home := os.Getenv("HOME")
 		if home == "" {
 			return "", errors.New("HOME not set")
 		}
-		return filepath.Join(home, strings.TrimPrefix(path, "~")), nil
+		return home, nil
+	}
+	if strings.HasPrefix(path, "~/") {
+		home := os.Getenv("HOME")
+		if home == "" {
+			return "", errors.New("HOME not set")
+		}
+		return filepath.Join(home, path[2:]), nil
 	}
 	return path, nil
+}
+
+func codecLooksLikeHEVC(codec string) bool {
+	switch strings.ToLower(codec) {
+	case "hevc", "h265", "hev1", "hvc1":
+		return true
+	default:
+		return false
+	}
 }

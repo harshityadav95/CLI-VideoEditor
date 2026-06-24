@@ -1,9 +1,9 @@
 # CLI Video Stitcher (Apple Silicon Optimized)
 
-High-performance CLI video stitcher written in Go, optimized for Apple Silicon (M1/M2/M3, macOS arm64). It scans an input folder, analyzes formats using ffprobe, and concatenates MP4 files in serial order. It defaults to zero-reencode stream copy (fastest) and falls back to Apple VideoToolbox hardware encoding when needed. Prompts allow keeping or muting audio and setting the output file path.
+High-performance CLI video stitcher written in Go, optimized for Apple Silicon (M1/M2/M3, macOS arm64). It scans an input folder, analyzes formats using ffprobe, and concatenates MP4 files in serial order. It defaults to zero-reencode stream copy when the clips are uniform and falls back to Apple VideoToolbox hardware encoding when needed.
 
-- Input folder (default): `./sept 3` (non-recursive; handles spaces in path)
-- Output file (default): `~/Movies/stitched.mp4`
+- Input folder (default): `/Volumes/macvault/100GOPRO` (non-recursive; handles spaces in path)
+- Output file (default): `../combined/<timestamp>.mp4` relative to the input folder
 - Audio: keep by default; optional mute toggle
 - Preservation: keeps source resolution and encoding when possible via stream copy
 - Auto-deps: downloads static ffmpeg and ffprobe for macOS arm64 on first run
@@ -17,9 +17,9 @@ Source layout:
 ## Features
 
 - Fast-path concatenation via FFmpeg concat demuxer with stream copy:
-  - `-f concat -safe 0 -c copy -movflags +faststart`
+  - `-f concat -safe 0 -c copy`
 - Automatic detection of stream compatibility (codec, resolution, pixel format, fps/time base, audio layout)
-- Hardware-accelerated fallback encode (VideoToolbox) preserving original resolution and fps
+- Hardware-accelerated fallback encode (VideoToolbox) normalizing to the majority profile when streams differ
 - Audio options:
   - Keep audio streams (copy when compatible or AAC re-encode for fallback)
   - Mute (`-an`)
@@ -40,17 +40,16 @@ Source layout:
 go build -o bin/cli-videoeditor ./cmd/cli
 ```
 
-2) Run with defaults (interactive prompts on first run)
+2) Run with defaults
 
 ```bash
 ./bin/cli-videoeditor
 ```
 
 This will:
-- Scan `./sept 3` for `.mp4` files (non-recursive), natural-sort them by name
+- Scan `/Volumes/macvault/100GOPRO` for `.mp4` files (non-recursive), natural-sort them by name
 - Print an input summary (codec, resolution, fps, audio presence, total duration, uniformity)
-- Prompt to keep audio (default yes)
-- Prompt for output path (default `~/Movies/stitched.mp4`)
+- Write the result to `../combined/<timestamp>.mp4` relative to the input folder
 - Attempt stream-copy concat; fallback to VideoToolbox encode if incompatible
 
 3) Non-interactive usage
@@ -73,8 +72,8 @@ Note: When using `--no-prompt`, ensure your output path exists or can be created
 
 ## CLI Flags
 
-- `--input` string: Input directory (non-recursive). Default: `./sept 3`
-- `--output` string: Output file path. Default: `~/Movies/stitched.mp4`
+- `--input` string: Input directory (non-recursive). Default: `/Volumes/macvault/100GOPRO`
+- `--output` string: Output file path. Default: `../combined/<timestamp>.mp4` relative to the input folder
 - `--mute`: Mute audio in output (defaults to keeping audio)
 - `--force-fallback`: Force hardware-accelerated re-encode instead of stream copy
 - `--no-prompt`: Non-interactive run (no questions asked; uses provided/default values)
@@ -97,7 +96,6 @@ Note: When using `--no-prompt`, ensure your output path exists or can be created
 - Otherwise, re-encode using VideoToolbox:
   - Video: `h264_videotoolbox` for H.264 inputs, `hevc_videotoolbox` for HEVC inputs
   - Pixel format: `yuv420p` for compatibility
-  - `-movflags +faststart` for better playback on web and Apple players
   - Audio: copy when compatible; else AAC encode; or `-an` when muted
 
 4) Execute
@@ -111,7 +109,7 @@ Note: When using `--no-prompt`, ensure your output path exists or can be created
 - For incompatible inputs, uses Apple VideoToolbox hardware acceleration:
   - `h264_videotoolbox` or `hevc_videotoolbox`
   - Preserves original resolution and fps to maintain source fidelity
-- Avoids unnecessary metadata writes and uses `+faststart` to optimize output playback
+- Avoids unnecessary metadata writes and keeps the copy path direct
 
 ## Where ffmpeg/ffprobe come from
 
