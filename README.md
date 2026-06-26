@@ -25,6 +25,14 @@ Source layout:
   - Mute (`-an`)
 - Robust handling of file paths with spaces using concat file list quoting
 - No global dependency setup required: fetches static macOS arm64 ffmpeg/ffprobe builds and caches them locally
+- Interactive `2) Primary Horizontal` workflow for mixed `.jpg`, `.jpeg`, `.heic`, `.heif`, `.mov`, `.mp4`, and `.m4v` folders:
+  - Orders media by timestamp metadata, with file modification time as fallback
+  - Treats same-basename `.MOV` + still image pairs as Live Photos and uses the video
+  - Creates `processed/primary_horizontal_<timestamp>.mp4` in the input folder by default
+  - Uses the largest landscape resolution found in the folder and the highest video frame rate found
+  - Shows still images for 3 seconds and chooses 2-vs-3 vertical grouping by actual screen occupancy without cropping
+  - Plays grouped vertical videos/Live Photos side-by-side in parallel
+  - Normalizes segments with Apple VideoToolbox HEVC Main10 (`hevc_videotoolbox`) using a source-size-aware bitrate targeting about 3x the source media size or less, then stream-copy concatenates them
 
 ## Requirements
 
@@ -47,6 +55,9 @@ go build -o bin/cli-videoeditor ./cmd/cli
 ```
 
 This will:
+- Show an interactive option menu:
+  - `1) Stitch videos (current capability)` runs the original `.mp4` stitch workflow
+  - `2) Primary Horizontal` creates a horizontal chronology video from mixed photos/videos
 - Scan `/Volumes/macvault/100GOPRO` for `.mp4` files (non-recursive), natural-sort them by name
 - Print an input summary (codec, resolution, fps, audio presence, total duration, uniformity)
 - Write the result to `../combined/<timestamp>.mp4` relative to the input folder
@@ -66,6 +77,9 @@ This will:
 
 # Force fallback encode (skip stream copy)
 ./bin/cli-videoeditor --no-prompt --force-fallback
+
+# Run Primary Horizontal on a mixed photo/video folder
+./bin/cli-videoeditor --no-prompt --primary-horizontal --input "./camera roll"
 ```
 
 Note: When using `--no-prompt`, ensure your output path exists or can be created. The tool will expand `~` automatically.
@@ -77,6 +91,7 @@ Note: When using `--no-prompt`, ensure your output path exists or can be created
 - `--mute`: Mute audio in output (defaults to keeping audio)
 - `--force-fallback`: Force hardware-accelerated re-encode instead of stream copy
 - `--no-prompt`: Non-interactive run (no questions asked; uses provided/default values)
+- `--primary-horizontal`: Run the mixed photo/video Primary Horizontal workflow
 
 ## How it works
 
@@ -103,12 +118,30 @@ Note: When using `--no-prompt`, ensure your output path exists or can be created
 - Run FFmpeg with either the stream-copy plan or the fallback encode plan
 - Write output to the target path, creating directories if necessary
 
+## Primary Horizontal Workflow
+
+Choose `2) Primary Horizontal` from the interactive menu for folders that mix horizontal/vertical photos and videos.
+
+- Scans the input folder non-recursively for `.jpg`, `.jpeg`, `.heic`, `.heif`, `.mov`, `.mp4`, and `.m4v`
+- Sorts by media timestamp metadata (`creation_time` and common date tags), falling back to file modification time
+- Skips still images when a same-basename `.MOV` exists, so Apple Live Photos are added as video
+- Chooses a landscape target canvas from the highest-resolution media item in the folder
+- Matches the output frame rate to the highest video frame rate found in the folder, defaulting to 30 fps when the folder contains only photos
+- Renders still images for 3 seconds
+- Places up to 3 consecutive vertical still images side-by-side in one horizontal frame by scaling each proportionally into equal slots
+- Writes to `<input>/processed/primary_horizontal_<timestamp>.mp4` unless you enter a different output path
+- Chooses whether 2 or 3 consecutive vertical items fit better by comparing actual visible pixel area in the horizontal frame
+- Uses rotation metadata when classifying media, so rotated vertical Live Photo `.MOV` files are laid out as vertical media
+- Plays grouped vertical videos and Live Photos in parallel in their own side-by-side tiles, preserving aspect ratio without cropping
+- Encodes normalized segments with `hevc_videotoolbox`, HEVC Main10, explicit BT.709 color metadata, AAC audio, and then joins them with stream copy for Apple Silicon performance, strong compression, and better color fidelity than the original H.264 4:2:0 path
+
 ## Apple Silicon Optimization
 
 - Prefers zero-reencode stream copy to avoid decode/encode costs when inputs are uniform
 - For incompatible inputs, uses Apple VideoToolbox hardware acceleration:
   - `h264_videotoolbox` or `hevc_videotoolbox`
   - Preserves original resolution and fps to maintain source fidelity
+- Primary Horizontal uses VideoToolbox HEVC Main10 for high-quality compressed segment rendering and stream-copy final concatenation
 - Avoids unnecessary metadata writes and keeps the copy path direct
 
 ## Where ffmpeg/ffprobe come from
